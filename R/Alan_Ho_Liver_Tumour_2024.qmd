@@ -1,0 +1,629 @@
+---
+title: The efficacy of treatment on liver tumours in a cohort
+thanks: |
+  Grants or other notes about the article that should go
+  on the front page should be placed here. General
+  acknowledgments should be placed at the end of the article.
+authors:
+  - name: Alan Ho
+    address: University of Queensland
+    email: alanhostatistics@gmail.com
+keywords:
+  - Liver Tumours
+  - Survival Analysis
+abstract: |
+  The text of your abstract.  150 -- 250 words.
+format: pdf
+editor: visual
+---
+
+## Setup
+
+A good setup of a project requires the consideration of reproducibility that regardless of who or when a project is run the project can still run. There are two principles required this outcome. Firstly, is the consideration of R packages. Each project uses different packages and their versions which may change over time as different functions or classes within the package are added to or depreciated. Virtual environments such as `renv` assure that a snapshot of project package library is taken which records all the package versions of the project. This allows analysts and developers to develop R code on a common virtual environment and even deploy R code (such as R Shiny apps) to servers although the latter may require more sophisticated system containerisation beyond just managing R packages.
+
+The second principle is a simple one of using relative paths mainly in this case where all file paths are relative to something everyone will have access to such as the ,rproj file when setting up an RStudio project. This is why we use the find_rstudio_file() to obtain this path. The goal is whenever a person clones this repository from Github, Bitbucket or some other repository system they should be able restore the virtual environment using `renv::restore()` and then render the R markdown document without changing any of the file paths.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+library(rprojroot)
+library(tidyverse)
+library(survival)
+library(Hmisc)
+library(ggsurvfit)
+library(broom)
+library(cowplot)
+library(compareGroups)
+library(glue)
+library(encryptr)
+
+ROOT <- find_rstudio_root_file()
+```
+
+### Loading Data
+
+When it comes to clinical data, we need to consider data governance, privacy and security principles. Privacy is extremely important in all medical research requiring researchers to securely store data, rigously control access and use deidentified data if possible.
+
+If the data is being accessed from a database, we need to ensure that we control the access and logins. Flat files such as csv, xlsx or .dta files should be stored securely and not shared through unsecure channels. Ideally, these files should be contained in a secure platform such as SeRP giving an analysis platfrom to researchers where data custodians have control on what data and files enters and leaves. Some researchers like to create passwords to these files. I am giving an example using file encryption in R.
+
+```{r}
+#| echo: true
+#| eval: false
+
+# Start by generating ssh keys if you don't have these already. Create and secure password. I have included the password for demonstration only. 
+# password: qcifiscool
+genkeys()
+```
+
+```{r}
+#| eval: false
+#| echo: true
+
+# encrypt the file and securely store the origtinal file using the ssh keys and password. Any users requires at minimum the password and public key. 
+liver_tumour_file <- file.path(ROOT, 'data', 'Case_study_data.csv')
+encrypt_file(liver_tumour_file)
+
+# we create two new directories to store this data in encrypted and backup
+if(!dir.exists(file.path(ROOT, 'data', 'encrypted'))) dir.create(file.path(ROOT, 'data', 'encrypted'))
+
+if(!dir.exists(file.path(ROOT, 'data', 'backup'))) dir.create(file.path(ROOT, 'data', 'backup'))
+
+# now we move the file to another folder just to keep the encrypted and unencrypted files separate. We would store the unencrypted file securely as a backup 
+file.copy(
+  from = file.path(ROOT, 'data', 'Case_study_data.csv.encryptr.bin'),
+  to = file.path(ROOT, 'data', 'encrypted','Case_study_data.csv.encryptr.bin'),
+)
+
+file.copy(
+  from = file.path(ROOT, 'data', 'Case_study_data.csv'),
+  to = file.path(ROOT, 'data', 'backup','Case_study_data.csv'),
+)
+
+```
+
+Now we can load the data into memory. The below example shows how we might decrypt the file if we have the ssh keys and password. I have also included an non-encrypted version which runs by default for demonstration.
+
+```{r}
+#| echo: true
+
+USE_ENCRYPTED <- FALSE
+
+if(USE_ENCRYPTED){
+  
+  # decrypt data file prior to use
+  encrptyed_file_path <- file.path(ROOT, 'data', 'encrypted', 
+                                   "Case_study_data.csv.encryptr.bin")
+  decrypt_file(
+    encrptyed_file_path, 
+    file_name = file.path(ROOT, 'data', 'encrypted', 'Case_study_data.csv')
+  )
+  
+  liver_tumor_file <- file.path(ROOT, 'data', 'encrypted', 'Case_study_data.csv')
+  
+} else {
+  # use an unencrypted file if working in a secure environment such as SeRP
+  liver_tumour_file <- file.path(ROOT, 'data', 'backup', 'Case_study_data.csv')
+}
+
+liver_tumour <- read_csv(liver_tumour_file) %>% 
+  mutate(
+    # initial cleaning steps (which I apply here to save time)
+    
+    # ensure that date variables are correctly formatted (in this case as dmy).
+    # we can use lubridate package for ease 
+    across(c(Date_of_Death, Date_of_surgery, Last_follow.up), \(x) dmy(x)),
+    
+    # now we calculate a time until death (in days)
+    Time_until_Death = as.numeric(Last_follow.up - Date_of_surgery)
+      
+  )
+
+head(liver_tumour)
+```
+
+First thing to examine is whether there are duplicated `Patient_ID` in this data. In this particular dataset we are examining each `Patient_ID` to be unique as person can only have this outcome once. In other types of research questions such as longitudinal or multilevel data structures these types of duplicates are extended and modelled using more sophisicated methods. Even in survival analysis it may be possible to have stratified outcomes such as multiple outcome types such as stages of a disease or the patient having the outcome multiple times at different locations. Nevertheless, we see for this data set that there are no duplicated rows for `Patient_ID` so we can go ahead with the rest of our analysis.
+
+```{r}
+liver_tumour %>%
+  filter(duplicated(Patient_ID)) 
+
+```
+
+#### Categorical Predictors
+
+Let's begin our description of the data with categorical predictors `Treatment`, `Obese`, `Smoking.Status`, `Alcohol.Consumption` and `Multiple_tumors`.
+
+```{r}
+#| echo: true
+#| fig.height: 8 
+#| fig.cap: Distribution of Categorical Predictors 
+
+cat_predictors <- 
+  liver_tumour %>% 
+    transmute(
+      Patient_ID,
+      Gender,
+      across(
+        c(
+          Treatment, 
+          Multiple_tumors,
+          Obese,
+          Smoking.Status,
+          Alcohol.Consumption  
+        ),
+        \(x) as.character(x)
+      )
+    ) %>% 
+    pivot_longer(
+      cols = -Patient_ID,
+      names_to = 'Predictor',
+      values_to = 'Value'
+    ) %>% 
+  group_by(Predictor, Value) %>% 
+  summarise(
+    n = n()
+  ) %>% 
+  group_by(Predictor) %>% 
+  mutate(
+    percent = n/(sum(n))*100,
+    label = glue('{n} ({round(percent, 1)})')
+  ) %>% 
+  nest() %>% 
+  mutate(
+    plot = pmap(
+      list(Predictor, data),
+      
+      .f = function(predictor, df){
+        
+        df %>% 
+          ggplot(
+            aes(x = factor(Value), y = n)
+          ) +
+            geom_text(aes(label = label), nudge_y = 10) +
+            geom_bar(
+              stat = 'identity', 
+              fill = 'blue'
+            ) +
+            labs(x = predictor) + 
+            scale_y_continuous(limits = c(0, 60)) +
+            theme_bw()
+        
+      }
+    )
+  )
+
+cowplot::plot_grid(
+  plotlist = cat_predictors$plot,
+  ncol = 2
+)
+```
+
+The most notable aspects is that alcohol consumption across non-drinker, occasional drinker and regular drinker is fairly evenly distributed with no-drinkers consisting (30%), occasional drinkers (33.3%) and the highest regular drinkers (36.7%). Having multiple tumors is also quite evenly split between those with no multiple tumors (Multiple_tumors = 0, 51.7%) and those with multiple tumors (Multiple_tumors = 1, 48.3%). Smokers are also more common in this dataset with 61.7% reporting being smokers whereas the majority are not obese (68.3%). There are more female patients (58.3%) in this dataset than male patients.
+
+After initial investigation, we might consider adding factor labels to the categorical variables so they are easier to intrepret within figures and tables. We need to check though that each one is correctly refactored before changing these new factor versions of these predictors.
+
+```{r}
+#| echo: false
+liver_tumour <- 
+  liver_tumour %>% 
+    mutate(
+      
+      Treatment.factor = factor(Treatment, levels=c(0,1), labels = c('No', 'Yes')),
+      
+      Obese.factor = factor(Obese, levels = c(0,1), labels = c('No', 'Yes')),
+      
+      Smoking.Status.factor = factor(Smoking.Status, levels = c(1,2), labels = c('non-smoker', 'smoker')),
+      
+      Alcohol.Consumption.factor = factor(Alcohol.Consumption, levels = c(1,2,3), labels = c("don't drink", "occasional drinker", "regular drinker")),
+      
+      Multiple_tumors.factor = factor(Multiple_tumors, levels = c(0,1), labels = c('No', 'Yes'))
+    )
+
+
+tibble(
+  Predictor = c('Treatment', 'Smoking.Status', 'Alcohol.Consumption', 'Multiple_tumors'),
+  data = map(Predictor, ~{
+   liver_tumour %>% 
+      mutate(
+        Code = get(.x),
+        Label = get(str_c(.x, '.factor'))
+      ) %>% 
+      count(Code, Label) 
+  })
+) %>% 
+  unnest(data)
+
+
+
+```
+
+We should be be pretty confident we have recoded these correctly and can replace these variables if desired. This can also help us develop a data dictionary if necessary.
+
+```{r}
+# echo: true
+
+liver_tumour_refactored <- 
+  liver_tumour %>% 
+    select(
+      -Treatment, -Obese, -Alcohol.Consumption, -Smoking.Status, -Multiple_tumors
+    ) %>% 
+    rename(
+      Treatment = Treatment.factor, 
+      Obese = Obese.factor, 
+      Alcohol.Consumption = Alcohol.Consumption.factor, 
+      Smoking.Status = Smoking.Status.factor, 
+      Multiple_tumors = Multiple_tumors.factor
+    )
+  
+
+```
+
+\
+
+#### Continuous Predictors
+
+Now we can describe the data in more detail. Below shows one way to describe the continuous predictors using `summarise` with some reshaping of the data used as demonstration. Of course, it is simplier to do `describe` but this is in a nice table format useful for publications and reports.
+
+```{r}
+#| echo: true
+liver_tumor_con.predictors <- 
+  liver_tumour_refactored %>%
+    transmute(
+      Patient_ID,
+      Age,
+      Height,
+      Weight,
+      BMI,
+      Diam_Tumor,
+      Time_until_Death
+    ) %>% 
+    pivot_longer(
+      cols = -Patient_ID,
+      names_to = 'Predictor',
+      values_to = 'Value'
+    ) 
+
+liver_tumor_con.predictors %>% 
+  group_by(Predictor) %>% 
+  summarise(
+    minimum = min(Value, na.rm = T),
+    Q1 = quantile(Value, prob = 0.25, na.rm = T),
+    median = median(Value, na.rm = T),
+    Q3 = quantile(Value, prob = 0.75, na.rm = T),
+    max = max(Value),
+    missing = sum(is.na(Value))
+  ) %>% 
+  arrange(
+    match(
+      Predictor,
+      c(
+        'Age',
+        'Height',
+        'Weight',
+        'BMI',
+        'Diam_Tumor',
+        'Time_until_Death'
+      )
+    )
+  )
+
+```
+
+What we observe in the data is that there are no notable missing values for any of the continuous predictors. The youngest age is 31 whereas the oldest is 90. The descriptive statistics for height and weight seem all reasonable. Nevertheless, the Body Mass Index (BMI) has a maximum value of 104 which does not sound possible. Let's investigate the distributions further and then examine why this value might be happening. We can generate all plots using some nice features of `tidyverse` and `purrr` by looping over each predictor to generate and store each ggplot histogram.
+
+```{r}
+#| echo: true
+#| fig.height: 8
+#| fig.caption: Distribution of continuous predictors
+liver_tumor_con.predictors.nested <- 
+  liver_tumor_con.predictors %>% 
+    group_by(Predictor) %>% 
+    nest() %>% 
+    mutate(
+      histogram = 
+        pmap(
+          list(Predictor, data), 
+          
+          .f = function(predictor, df){
+            
+            df %>% 
+              ggplot(
+                aes(x = Value)
+              ) + 
+              geom_histogram(fill = 'blue', linetype = 1, color = 'black') +
+              labs(x = predictor) +
+              theme_bw()
+            
+            
+          })
+    )
+
+cowplot::plot_grid(
+  plotlist = liver_tumor_con.predictors.nested$histogram,
+  ncol = 2
+)
+```
+
+This graphic presentation shows age is right skewed to older patients whereas height and weight appear to be slightly left skewed. Likewise the time until death after surgery appears to be left skewed as well to shorter times which is concerning. We will see what affects this later. Finally, we note that one patient with that very high \> 100 BMI. Let's find this patient.
+
+```{r}
+#| echo: true
+liver_tumour_refactored %>% 
+  filter(BMI > 40) %>% 
+  transmute(
+    Patient_ID,
+    Height,
+    Weight,
+    BMI,
+    BMI_recalculated = Weight/(Height/100)^2
+  )
+```
+
+This patient appears to have their BMI incorrectly calculated so we can recalculate (or check the original calculation) just to be sure. I am using the formula provided by CDC <https://www.cdc.gov/nccdphp/dnpao/growthcharts/training/bmiage/page5_1.html#:~:text=With%20the%20metric%20system%2C%20the,multiply%20the%20result%20by%2010%2C000.>
+
+```{r}
+#| echo: true
+
+liver_tumour_cleaned <- 
+  liver_tumour_refactored %>% 
+    mutate(
+      BMI_recalculated = Weight/(Height/100)^2
+    )
+
+```
+
+Now just check that this new formula is similar within one decimal place of the original (with the exception of the incorrectly BMI). We use an arbitrary threshold of 0.1 to find any BMI recalculations that don't match the original. We see that this is only for that one incorrect case.
+
+```{r}
+#| echo: true
+liver_tumour_cleaned %>% 
+  mutate(
+    BMI_difference = round(BMI_recalculated - BMI, 1)
+  ) %>% 
+  filter(
+    abs(BMI_difference) > 0.1
+  )
+```
+
+Now we feel confident to replace the BMI column with the recalculated / corrected version. We also bin the Diam_tumor into three bins based on this paper for later use <https://onlinelibrary.wiley.com/doi/10.1155/2023/1106975#:~:text=The%20results%20using%20univariate%20analysis,had%20a%20lower%20survival%20rate.>
+
+```{r}
+#| echo: true
+liver_tumour_corrected <- 
+  liver_tumour_cleaned %>% 
+    select(
+      -BMI
+    ) %>% 
+  rename('BMI' = 'BMI_recalculated') %>% 
+  mutate(
+    Diam_Tumor.binned = case_when(
+      Diam_Tumor <2 ~ '<2 cm',
+      between(Diam_Tumor, 2, 5) ~ '2-5 cm',
+      Diam_Tumor > 5 ~ '>5 cm'
+    )
+           
+  )
+
+head(liver_tumour_corrected)
+```
+
+### Predictors of death outcomes
+
+Below shows the effect of treatment, presence of multiple tumours and diameter of tumour on percentage of patients who died at their final follow up. While of all these seem to indicate that death is not associated with the treatment, having multiple tumours or tumour diameter based on the percentage of death at the end point. However, this is deceptive and we should look to see what their survival experience over their entire follow up period. Additionally, many of these patients are right censored at their final observation so they may or may not have died.
+
+```{r}
+#| fig.height: 5
+#| fig.cap: Percentage of death by presence of multiple tumours
+liver_tumour_corrected %>% 
+  group_by(Treatment) %>% 
+  summarise(
+    number_died = n_distinct(Patient_ID)
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    `% Died` = number_died/sum(number_died)*100
+  ) %>% 
+  ggplot(
+    aes(x = Treatment, y = `% Died`)
+  ) + 
+    geom_bar(stat = 'identity', fill = 'blue') +
+    theme_bw()
+
+```
+
+```{r}
+#| fig.height: 5
+#| fig.cap: Percentage of death by presence of multiple tumours
+
+liver_tumour_corrected %>% 
+  group_by(Multiple_tumors) %>% 
+  summarise(
+    number_died = n_distinct(Patient_ID)
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    `% Died` = number_died/sum(number_died)*100
+  ) %>% 
+  ggplot(
+    aes(x = Multiple_tumors, y = `% Died`)
+  ) + 
+    geom_bar(stat = 'identity', fill = 'blue') +
+    theme_bw() 
+```
+
+```{r}
+
+liver_tumour_corrected %>% 
+  group_by(Death_status) %>% 
+  summarise(
+    mean_diameter = mean(Diam_Tumor),
+    sd_diameter = sd(Diam_Tumor)
+  ) %>% 
+  ungroup() %>%  
+  ggplot(
+    aes(x = Death_status, y = mean_diameter)
+  ) + 
+    geom_bar(stat = 'identity', fill = 'blue') +
+    geom_errorbar(aes(ymin = mean_diameter, ymax = mean_diameter+ sd_diameter), width = 0.1) +
+    theme_bw() +
+    labs(y = 'Mean Tumour Diameter in cm (+-SD)')
+```
+
+Before we do that though we might want to look at the overall survival experience of patients with liver tumors. Let's do this using a Kaplan-Meier estimate
+
+```{r}
+#| echo: true
+#| fig.height: 6
+#| fig.cap: Kaplan-Meier Survival Curves of all patients
+
+surv_fit <- survfit(Surv(Time_until_Death, Death_status) ~ 1, data = liver_tumour_corrected)
+
+
+surv_fit %>%  
+  ggsurvfit(type = "survival") +
+  ggsurvfit::add_risktable() +
+  add_confidence_interval() +
+  labs(y = 'Prop Survival')
+```
+
+From the survival fit, we observe that there 30 events out a possible 60 patients with a median survival time of 128 days post surgery.
+
+```{r}
+#| echo: true
+surv_fit
+```
+
+Below shows the Kaplan-Meier survival curves for each predictor (including Diameter of Tumor binned). The results are much clearer as Treatment clearly has an effect on survival with those without the treatment had survival rates drop rapidly after 100 days post surgery whereas those with the treatment had survival rates remain somewhat flat at 75% after 100 days until their final follow-up. The presence of multiple tumors also had an impact on survival rates where those with multiple tumors also had rapid declines in survival after surgery compared to those without. It is less clear about the impact of wider tumor diameter though higher \>5 cm diameter tumors also lead to significantly worse survival rates.
+
+```{r}
+#| echo: true
+#| fig.height: 8
+#| fig.cap: Kaplan Meier Estimates across predictors
+predictors <- c('Treatment', 'Gender', 'Multiple_tumors', 'Diam_Tumor.binned', 'Smoking.Status', 'Alcohol.Consumption', 'Obese')
+
+unadjusted_results <- 
+  tibble(
+    predictor = predictors,
+    survformula = map(predictor, ~{
+      as.formula(glue('Surv(Time_until_Death, Death_status) ~ {.x}'))
+    }),
+    
+    survival_plot = map(survformula, ~{
+      (.x) %>% 
+        survfit(data = liver_tumour_corrected) %>% 
+        ggsurvfit(type = "survival") +
+        add_confidence_interval() +
+        labs(y = 'Prop Survival')
+      }),
+    
+    unadjusted_model = map(survformula, ~{
+      coxph(.x, data = liver_tumour_corrected)
+    }),
+    
+    unadjusted_model_tidy = map(unadjusted_model, ~tidy(., exponentiate = T, conf.int = T))
+    
+  )
+
+cowplot::plot_grid(
+  plotlist = unadjusted_results$survival_plot,
+  ncol = 2
+)
+
+```
+
+Below we note that multiple tumours appears to related to other predictors most notably treatment with higher proportion of multiple tumors in the no treatment group, in males who had treatment and in those who are obese.
+
+```{r}
+#| echo: true
+res <- compareGroups(Multiple_tumors~Treatment + Diam_Tumor + Gender + Age + BMI + Obese + Smoking.Status + Alcohol.Consumption , data=liver_tumour_corrected)
+
+createTable(res)
+```
+
+Tumor diameter is also found to be wider in the no treated group with a greater proportion of those without treatment having \>5 cm tumors (57.1% vs 18.2%).
+
+```{r}
+#| echo: true
+res <- compareGroups(Diam_Tumor.binned~Multiple_tumors + Treatment + Gender + Age + BMI + Obese + Smoking.Status + Alcohol.Consumption , data=liver_tumour_corrected)
+
+createTable(res)
+```
+
+Multiple tumors and tumor diameter could be confounding our results examining the effect of treatment. We need to statistically control for these effects using the model below.
+
+#### Modelling survival using Cox Proportional Hazards Regression
+
+In this example, we will create an adjusted model to examine effect of the various predictors on survival using a Cox Proportional Hazards Regression model.
+
+```{r}
+#| echo: true
+
+predictors <- c(
+  'Treatment',
+  'Multiple_tumors',
+  'Diam_Tumor',
+  'Gender',
+  'Age',
+  'Obese',
+  'Smoking.Status',
+  'Alcohol_consumption.Status'
+)
+
+adjusted_formula = as.formula(
+Surv(Time_until_Death, Death_status) ~ Treatment + Multiple_tumors + Diam_Tumor + Gender + Age + Obese + Smoking.Status + Alcohol.Consumption)
+
+adjusted_cox_model <- coxph(
+  adjusted_formula,
+  data = liver_tumour_corrected
+)
+
+adjusted_cox_model %>% 
+  tidy(exponentiate = T, conf.int = T) %>% 
+  select(
+    term,
+    estimate,
+    conf.low,
+    conf.high,
+    p.value
+  )
+```
+
+The results indicate that Treatment after controlling for all other predictors had a significant effect on survival (HR_adjusted = 0.283, 95% CI: 0.109 to 0.735, p = 0.009). Put differently, those without treatment die at at rate `r (1-0.283)*100`% higher with the estimate rate being as low as `r (1-0.735)*100` times higher to as high as `r (1-0.109)*100`. According to our unadjusted results, the effect of treatment was actually pretty similar before adjusted for other confounding variables such as tumor diameter. So they may not have had that much impact after all
+
+Interestingly, we note that multiple tumours and tumour diameter do not have a significant effect on survival after accounting other variables such as treatment, smoking, alcohol consumption and obese status. Compare this to the unadjusted hazard ratios where multiple tumours had a significant impact on survival rates with higher death rates for those with multiple tumours.
+
+```{r}
+#| echo: true
+unadjusted_results %>% select(unadjusted_model_tidy) %>% unnest() 
+```
+
+In both unadjusted and adjusted models, obesity has a significant impact on survival with those who are obese having significantly higher hazard / death rates (HR_adjusted = 2.32, 95% CI: 1.13 to 4.76).
+
+#### Assessing model fit
+
+NOTE: normally we should be doing this step while we are developing the models but we are doing it here for demonstration.
+
+The proportional hazards assumption of Cox regression assumes that the effect of any predictor remains constant over time. In other words, the hazard ratio of 0.283 where those who were treated have 71% higher average survival rates than those without the treatment regardless whether we look at their survival rates just a few weeks after post surgery or several years after surgery. In other words, the benefits of treatment have the same impact regardless when they are assessed. The impact of some predictors on survival may have dependent on time. That is, they have greater impact early on or perhaps later on. For instance, there may be little impact of some treatments early on in liver cancer but does impact the survival rates of those in late stage cancer. This is known as a time-dependent covariate and requires different types of statistical models to describe. In recent years, more sophisticated models such as joint models have been used to model how a predictor changes over time and how this change impacts survival e.g. blood pressure, growth or decline in tumours, etc.
+
+So how do we assess whether this assumption is met. While there are different approaches basically we examine whether the . Residuals are leftovers from any statistical model we fit to data. If the model we fitted is a pretty good explanation of the data, then these residuals (left overs) will contain no useful information that hasn't been captured by the model. In the case of Cox regression, we use approximate Schoenfeld residuals to assess how much proportional hazards have captured the essence of the data.
+
+According to goodness of fit tests (we are only using time here though we can also use log(time), rank(time), etc to better assess this assumption. Nevertheless, we note that treatment is significant indicating that there is some relationship between treatment and time on hazard rates violating our proportional hazards assumption.
+
+```{r}
+# echo: true
+
+adjusted_fit_diagnostics <- cox.zph(adjusted_cox_model)
+
+adjusted_fit_diagnostics
+```
+
+Examining our residual plot, we observe that the Schoenfeld residuals for our hazard rates (listed as beta(t) here) are not randomly scattered around 0 and appear to become more negative as time goes along. In other words, the difference in survival becomes greater the longer the patients are followed up. This makes sense as we saw in the Kaplan Meier curves where treated patients had a flat survival curve whereas those without treatment kept declining. This suggests that our treatment is better than estimated here by the Cox model but requires some other extensions such as separating treatment into treatment at different time points (time varying predictor).
+
+```{r}
+
+plot(adjusted_fit_diagnostics[1]) # plot curves
+
+abline (h = coef(adjusted_fit_diagnostics)[1], lty = "dotted", lwd = 1)
+
+```
